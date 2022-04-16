@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euxo pipefail
 
+# needed to populate $UBUNTU_CODENAME variable used further below
 source /etc/os-release
 
 # required by apt-key
