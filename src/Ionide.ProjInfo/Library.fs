@@ -113,11 +113,15 @@ module SdkDiscovery =
 // functions for legacy style project files
 module LegacyFrameworkDiscovery =
 
+    type MsbuildLocation =
+        { MsbuildDir: DirectoryInfo
+          MsbuildLibDir: DirectoryInfo }
+
     let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
     let isMac = RuntimeInformation.IsOSPlatform OSPlatform.OSX
     let isUnix = isLinux || isMac
 
-    let internal msbuildBinary =
+    let private msbuildBinary =
         lazy
             (if isLinux then
                  "/usr/bin/msbuild" |> FileInfo |> Some
@@ -149,14 +153,25 @@ module LegacyFrameworkDiscovery =
                  | Some exe when exe.Exists -> Some exe
                  | _ -> None)
 
-    let internal msbuildLibPath (msbuildDir: DirectoryInfo) =
-        if isLinux then
-            "/usr/lib/mono/xbuild"
-        elif isMac then
-            "/Library/Frameworks/Mono.framework/Versions/Current/lib/mono/xbuild"
-        else
-            // example: C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\MSBuild
-            Path.Combine(msbuildDir.FullName, "..", "..") |> Path.GetFullPath
+    let internal msbuildLocation () =
+        match msbuildBinary.Value with
+        | Some msbuildBinary ->
+
+            let msbuildDir = msbuildBinary.Directory
+
+            let msbuildLibDir =
+                if isLinux then
+                    "/usr/lib/mono/xbuild" |> DirectoryInfo
+                elif isMac then
+                    "/Library/Frameworks/Mono.framework/Versions/Current/lib/mono/xbuild" |> DirectoryInfo
+                else
+                    // example: C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\MSBuild
+                    Path.Combine(msbuildDir.FullName, "..", "..") |> Path.GetFullPath |> DirectoryInfo
+
+            { MsbuildDir = msbuildDir
+              MsbuildLibDir = msbuildLibDir }
+            |> Some
+        | None -> None
 
 [<RequireQualifiedAccess>]
 module Init =
@@ -225,20 +240,24 @@ module Init =
         resolveHandler <- resolveFromSdkRoot sdkRoot
         AssemblyLoadContext.Default.add_Resolving resolveHandler
 
-    let internal setupForLegacyFramework (msbuildPathDir: DirectoryInfo) =
-        let msbuildLibPath = LegacyFrameworkDiscovery.msbuildLibPath msbuildPathDir
+    let internal setupForLegacyFramework () =
+        let msbuildLocationOpt = LegacyFrameworkDiscovery.msbuildLocation ()
 
-        // gotta set some env variables so msbuild interop works
-        if LegacyFrameworkDiscovery.isUnix then
-            Environment.SetEnvironmentVariable("MSBuildBinPath", "/usr/lib/mono/msbuild/Current/bin")
-            Environment.SetEnvironmentVariable("FrameworkPathOverride", "/usr/lib/mono/4.5")
-        else
-            // VsInstallRoot is required for legacy project files
-            // example: C:\Program Files (x86)\Microsoft Visual Studio\2019\Community
-            let vsInstallRoot = Path.Combine(msbuildPathDir.FullName, "..", "..", "..") |> Path.GetFullPath
-            Environment.SetEnvironmentVariable("VsInstallRoot", vsInstallRoot)
+        match msbuildLocationOpt with
+        | Some msbuildLocation ->
+            // gotta set some env variables so msbuild interop works
+            if LegacyFrameworkDiscovery.isUnix then
+                Environment.SetEnvironmentVariable("MSBuildBinPath", "/usr/lib/mono/msbuild/Current/bin")
+                Environment.SetEnvironmentVariable("FrameworkPathOverride", "/usr/lib/mono/4.5")
+            else
+                // VsInstallRoot is required for legacy project files
+                // example: C:\Program Files (x86)\Microsoft Visual Studio\2019\Community
+                let vsInstallRoot = Path.Combine(msbuildLocation.MsbuildDir.FullName, "..", "..", "..") |> Path.GetFullPath
+                Environment.SetEnvironmentVariable("VsInstallRoot", vsInstallRoot)
 
-        Environment.SetEnvironmentVariable("MSBuildExtensionsPath32", ensureTrailer msbuildLibPath)
+            Environment.SetEnvironmentVariable("MSBuildExtensionsPath32", ensureTrailer msbuildLocation.MsbuildLibDir.FullName)
+        | None -> ()
+
 
     /// Initialize the MsBuild integration. Returns path to MsBuild tool that was detected by Locator. Needs to be called before doing anything else.
     /// Call it again when the working directory changes.
@@ -391,13 +410,6 @@ module ProjectLoader =
                "_ComputeNonExistentFileProperty"
                "CoreCompile" |]
 
-    let setLegacyMsbuildProperties isOldStyleProjFile =
-        match LegacyFrameworkDiscovery.msbuildBinary.Value with
-        | Some file ->
-            let msbuildBinaryDir = file.Directory
-            Init.setupForLegacyFramework msbuildBinaryDir
-        | _ -> ()
-
     let loadProject (path: string) (binaryLogs: BinaryLogGeneration) globalProperties =
         try
             let isLegacyFrameworkProjFile =
@@ -413,7 +425,7 @@ module ProjectLoader =
             let readingProps = getGlobalProps path None globalProperties
 
             if isLegacyFrameworkProjFile then
-                setLegacyMsbuildProperties isLegacyFrameworkProjFile
+                Init.setupForLegacyFramework ()
 
             let tfm = getTfm path readingProps isLegacyFrameworkProjFile
 
